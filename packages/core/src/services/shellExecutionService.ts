@@ -19,7 +19,10 @@ import {
   serializeTerminalToObject,
   type AnsiOutput,
 } from '../utils/terminalSerializer.js';
+import { createDebugLogger } from '../utils/debugLogger.js';
 const { Terminal } = pkg;
+
+const debugLogger = createDebugLogger('SHELL_EXECUTION');
 
 const SIGKILL_TIMEOUT_MS = 200;
 const WINDOWS_PATH_DELIMITER = ';';
@@ -219,6 +222,35 @@ const isExpectedPtyExitRaceError = (error: unknown): boolean => {
   );
 };
 
+// Efficient comparison for AnsiOutput arrays without JSON.stringify
+const outputsDiffer = (a: AnsiOutput, b: AnsiOutput): boolean => {
+  if (!Array.isArray(a) || !Array.isArray(b)) return true;
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) {
+    const lineA = a[i];
+    const lineB = b[i];
+    if (!Array.isArray(lineA) || !Array.isArray(lineB)) return true;
+    if (lineA.length !== lineB.length) return true;
+    for (let j = 0; j < lineA.length; j++) {
+      const tokenA = lineA[j];
+      const tokenB = lineB[j];
+      if (
+        tokenA.text !== tokenB.text ||
+        tokenA.bold !== tokenB.bold ||
+        tokenA.italic !== tokenB.italic ||
+        tokenA.underline !== tokenB.underline ||
+        tokenA.dim !== tokenB.dim ||
+        tokenA.inverse !== tokenB.inverse ||
+        tokenA.fg !== tokenB.fg ||
+        tokenA.bg !== tokenB.bg
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
+
 const getFullBufferText = (terminal: pkg.Terminal): string => {
   const buffer = terminal.buffer.active;
   const lines: string[] = [];
@@ -412,7 +444,9 @@ export class ShellExecutionService {
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
+        const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB limit to prevent OOM
         let sniffedBytes = 0;
+        let totalBytesReceived = 0;
 
         const handleOutput = (data: Buffer, stream: 'stdout' | 'stderr') => {
           if (!stdoutDecoder || !stderrDecoder) {
@@ -426,7 +460,17 @@ export class ShellExecutionService {
             }
           }
 
-          outputChunks.push(data);
+          // Check buffer size limit to prevent OOM on low-memory systems
+          if (totalBytesReceived + data.length > MAX_BUFFER_SIZE) {
+            debugLogger.warn(
+              `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating. ` +
+                `Total received: ${totalBytesReceived} bytes.`,
+            );
+            // Don't push more data if we've hit the limit
+          } else {
+            outputChunks.push(data);
+            totalBytesReceived += data.length;
+          }
 
           if (isStreamingRawContent && sniffedBytes < MAX_SNIFF_SIZE) {
             const sniffBuffer = Buffer.concat(outputChunks.slice(0, 20));
@@ -613,6 +657,7 @@ export class ShellExecutionService {
           allowProposedApi: true,
           cols,
           rows,
+          scrollback: 1000,
         });
         headlessTerminal.scrollToTop();
 
@@ -627,6 +672,7 @@ export class ShellExecutionService {
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
+        const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB limit to prevent OOM
         let sniffedBytes = 0;
         let totalBytesReceived = 0;
         let isWriting = false;
@@ -695,8 +741,17 @@ export class ShellExecutionService {
             ? newOutput
             : trimmedOutput;
 
-          // Using stringify for a quick deep comparison.
-          if (JSON.stringify(output) !== JSON.stringify(finalOutput)) {
+          // Use reference equality for primitive output or quick check
+          // to avoid expensive JSON.stringify on large outputs
+          const outputChanged =
+            output === null ||
+            (Array.isArray(finalOutput) &&
+              (output as AnsiOutput).length !== finalOutput.length);
+
+          if (
+            outputChanged ||
+            outputsDiffer(output as AnsiOutput, finalOutput)
+          ) {
             output = finalOutput;
             onOutputEvent({
               type: 'data',
@@ -761,8 +816,18 @@ export class ShellExecutionService {
           // slower than appending a Buffer, and rapid PTY output can otherwise
           // overrun the render queue before finalize() races on exit.
           ensureDecoder(data);
-          outputChunks.push(data);
-          totalBytesReceived += data.length;
+
+          // Check buffer size limit to prevent OOM on low-memory systems
+          if (totalBytesReceived + data.length > MAX_BUFFER_SIZE) {
+            debugLogger.warn(
+              `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating. ` +
+                `Total received: ${totalBytesReceived} bytes.`,
+            );
+            // Don't push more data if we've hit the limit
+          } else {
+            outputChunks.push(data);
+            totalBytesReceived += data.length;
+          }
           const bytesReceived = totalBytesReceived;
 
           processingChain = processingChain.then(
