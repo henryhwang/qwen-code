@@ -34,12 +34,12 @@ export const enum ColorMode {
 }
 
 class Cell {
-  private readonly cell: IBufferCell | null;
   private readonly x: number;
   private readonly y: number;
   private readonly cursorX: number;
   private readonly cursorY: number;
   private readonly attributes: number = 0;
+  private readonly chars: string;
   fg = 0;
   bg = 0;
   fgColorMode: ColorMode = ColorMode.DEFAULT;
@@ -52,15 +52,17 @@ class Cell {
     cursorX: number,
     cursorY: number,
   ) {
-    this.cell = cell;
     this.x = x;
     this.y = y;
     this.cursorX = cursorX;
     this.cursorY = cursorY;
 
     if (!cell) {
+      this.chars = ' ';
       return;
     }
+
+    this.chars = cell.getChars();
 
     if (cell.isInverse()) {
       this.attributes += Attribute.inverse;
@@ -112,7 +114,7 @@ class Cell {
   }
 
   getChars(): string {
-    return this.cell?.getChars() || ' ';
+    return this.chars;
   }
 
   isAttribute(attribute: Attribute): boolean {
@@ -148,6 +150,7 @@ export function serializeTerminalToObject(
   const cursorY = clampedOffset === 0 ? buffer.cursorY : -1;
 
   const result: AnsiOutput = [];
+  const reusableCell = terminal.buffer.active.getNullCell();
 
   for (let y = 0; y < terminal.rows; y++) {
     const line = buffer.getLine(startRow + y);
@@ -161,7 +164,7 @@ export function serializeTerminalToObject(
     let currentText = '';
 
     for (let x = 0; x < terminal.cols; x++) {
-      const cellData = line.getCell(x);
+      const cellData = line.getCell(x, reusableCell);
       const cell = new Cell(cellData || null, x, y, cursorX, cursorY);
 
       if (x > 0 && !cell.equals(lastCell)) {

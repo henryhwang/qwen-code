@@ -271,15 +271,19 @@ const replayTerminalOutput = async (
     allowProposedApi: true,
     cols,
     rows,
-    scrollback: 10000,
+    scrollback: 1000, // Reduced from 10000 to prevent OOM
     convertEol: true,
   });
 
-  await new Promise<void>((resolve) => {
-    replayTerminal.write(output, () => resolve());
-  });
+  try {
+    await new Promise<void>((resolve) => {
+      replayTerminal.write(output, () => resolve());
+    });
 
-  return getFullBufferText(replayTerminal);
+    return getFullBufferText(replayTerminal);
+  } finally {
+    replayTerminal.dispose();
+  }
 };
 
 interface ProcessCleanupStrategy {
@@ -444,7 +448,7 @@ export class ShellExecutionService {
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
-        const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB limit to prevent OOM
+        const MAX_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB limit to prevent OOM on low-memory systems
         let sniffedBytes = 0;
         let totalBytesReceived = 0;
 
@@ -460,8 +464,10 @@ export class ShellExecutionService {
             }
           }
 
+          totalBytesReceived += data.length;
+
           // Check buffer size limit to prevent OOM on low-memory systems
-          if (totalBytesReceived + data.length > MAX_BUFFER_SIZE) {
+          if (totalBytesReceived > MAX_BUFFER_SIZE) {
             debugLogger.warn(
               `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating. ` +
                 `Total received: ${totalBytesReceived} bytes.`,
@@ -469,7 +475,6 @@ export class ShellExecutionService {
             // Don't push more data if we've hit the limit
           } else {
             outputChunks.push(data);
-            totalBytesReceived += data.length;
           }
 
           if (isStreamingRawContent && sniffedBytes < MAX_SNIFF_SIZE) {
@@ -485,10 +490,15 @@ export class ShellExecutionService {
             const decoder = stream === 'stdout' ? stdoutDecoder : stderrDecoder;
             const decodedChunk = decoder.decode(data, { stream: true });
 
+            // Limit string accumulation to prevent memory exhaustion
             if (stream === 'stdout') {
-              stdout += decodedChunk;
+              if (stdout.length < MAX_BUFFER_SIZE) {
+                stdout += decodedChunk;
+              }
             } else {
-              stderr += decodedChunk;
+              if (stderr.length < MAX_BUFFER_SIZE) {
+                stderr += decodedChunk;
+              }
             }
           }
         };
@@ -500,8 +510,13 @@ export class ShellExecutionService {
           const { finalBuffer } = cleanup();
           // Ensure we don't add an extra newline if stdout already ends with one.
           const separator = stdout.endsWith('\n') ? '' : '\n';
-          const combinedOutput =
+          let combinedOutput =
             stdout + (stderr ? (stdout ? separator : '') + stderr : '');
+
+          // Add truncation notice if output was truncated
+          if (totalBytesReceived >= MAX_BUFFER_SIZE) {
+            combinedOutput += `\n\n[OUTPUT TRUNCATED - exceeded ${MAX_BUFFER_SIZE} bytes limit to prevent OOM]`;
+          }
 
           const finalStrippedOutput = stripAnsi(combinedOutput).trim();
 
@@ -650,6 +665,7 @@ export class ShellExecutionService {
           GIT_PAGER: shellExecutionConfig.pager ?? 'cat',
         },
         handleFlowControl: true,
+        encoding: null,
       });
 
       const result = new Promise<ShellExecutionResult>((resolve) => {
@@ -672,7 +688,7 @@ export class ShellExecutionService {
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
-        const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB limit to prevent OOM
+        const MAX_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB limit to prevent OOM on low-memory systems
         let sniffedBytes = 0;
         let totalBytesReceived = 0;
         let isWriting = false;
@@ -817,17 +833,22 @@ export class ShellExecutionService {
           // overrun the render queue before finalize() races on exit.
           ensureDecoder(data);
 
+          totalBytesReceived += data.length;
+
           // Check buffer size limit to prevent OOM on low-memory systems
-          if (totalBytesReceived + data.length > MAX_BUFFER_SIZE) {
-            debugLogger.warn(
-              `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating. ` +
-                `Total received: ${totalBytesReceived} bytes.`,
-            );
-            // Don't push more data if we've hit the limit
-          } else {
-            outputChunks.push(data);
-            totalBytesReceived += data.length;
+          if (totalBytesReceived > MAX_BUFFER_SIZE) {
+            if (outputChunks.length > 0) {
+              debugLogger.warn(
+                `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating stream processing. ` +
+                  `Total received: ${totalBytesReceived} bytes.`,
+              );
+            }
+            // STOP processing and adding to chain once we hit the limit.
+            // This prevents OOM on extremely large outputs (e.g. cat large_file.txt).
+            return;
           }
+
+          outputChunks.push(data);
           const bytesReceived = totalBytesReceived;
 
           processingChain = processingChain.then(
@@ -862,8 +883,10 @@ export class ShellExecutionService {
           );
         };
 
-        ptyProcess.onData((data: string) => {
-          const bufferData = Buffer.from(data, 'utf-8');
+        ptyProcess.onData((data: string | Buffer) => {
+          const bufferData = Buffer.isBuffer(data)
+            ? data
+            : Buffer.from(data, 'utf-8');
           handleOutput(bufferData);
         });
 
@@ -891,6 +914,7 @@ export class ShellExecutionService {
               render(true);
               const finalBuffer = Buffer.concat(outputChunks);
               let fullOutput = '';
+              const wasTruncated = totalBytesReceived >= MAX_BUFFER_SIZE;
 
               try {
                 if (isStreamingRawContent) {
@@ -917,6 +941,13 @@ export class ShellExecutionService {
                   // Ignore fallback rendering errors and resolve with empty text.
                 }
               }
+
+              // Append truncation notice if output was truncated
+              if (wasTruncated) {
+                fullOutput += `\n\n[OUTPUT TRUNCATED - exceeded ${MAX_BUFFER_SIZE} bytes limit to prevent OOM]`;
+              }
+
+              headlessTerminal.dispose();
 
               resolve({
                 rawOutput: finalBuffer,
