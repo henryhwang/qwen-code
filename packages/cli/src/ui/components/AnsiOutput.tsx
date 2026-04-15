@@ -28,23 +28,57 @@ export const AnsiOutputText: React.FC<AnsiOutputProps> = ({
       ? availableTerminalHeight
       : DEFAULT_HEIGHT),
   );
-  return lastLines.map((line: AnsiLine, lineIndex: number) => (
-    <Text key={lineIndex}>
-      {line.length > 0
-        ? line.map((token: AnsiToken, tokenIndex: number) => (
+  return lastLines.map((line: AnsiLine, lineIndex: number) => {
+    if (line.length === 0) return <Text key={lineIndex} />;
+
+    const groupedTokens: Array<{ tokens: AnsiToken[] }> = [];
+    let currentGroup: AnsiToken[] = [];
+
+    line.forEach((token) => {
+      if (currentGroup.length === 0) {
+        currentGroup.push(token);
+      } else {
+        const last = currentGroup[currentGroup.length - 1];
+        if (
+          token.fg === last.fg &&
+          token.bg === last.bg &&
+          token.bold === last.bold &&
+          token.italic === last.italic &&
+          token.underline === last.underline &&
+          token.dim === last.dim &&
+          token.inverse === last.inverse
+        ) {
+          currentGroup.push(token);
+        } else {
+          groupedTokens.push({ tokens: currentGroup });
+          currentGroup = [token];
+        }
+      }
+    });
+    if (currentGroup.length > 0) {
+      groupedTokens.push({ tokens: currentGroup });
+    }
+
+    return (
+      <Text key={lineIndex}>
+        {groupedTokens.map((group, groupIndex) => {
+          const first = group.tokens[0];
+          const combinedText = group.tokens.map((t) => t.text).join('');
+          return (
             <Text
-              key={tokenIndex}
-              color={token.inverse ? token.bg : token.fg}
-              backgroundColor={token.inverse ? token.fg : token.bg}
-              dimColor={token.dim}
-              bold={token.bold}
-              italic={token.italic}
-              underline={token.underline}
+              key={groupIndex}
+              color={first.inverse ? first.bg : first.fg}
+              backgroundColor={first.inverse ? first.fg : first.bg}
+              dimColor={first.dim}
+              bold={first.bold}
+              italic={first.italic}
+              underline={first.underline}
             >
-              {token.text}
+              {combinedText}
             </Text>
-          ))
-        : null}
-    </Text>
-  ));
+          );
+        })}
+      </Text>
+    );
+  });
 };

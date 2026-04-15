@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { IBufferCell, Terminal } from '@xterm/headless';
+import type { Terminal } from '@xterm/headless';
 export interface AnsiToken {
   text: string;
   bold: boolean;
@@ -31,106 +31,6 @@ export const enum ColorMode {
   DEFAULT = 0,
   PALETTE = 1,
   RGB = 2,
-}
-
-class Cell {
-  private readonly x: number;
-  private readonly y: number;
-  private readonly cursorX: number;
-  private readonly cursorY: number;
-  private readonly attributes: number = 0;
-  private readonly chars: string;
-  fg = 0;
-  bg = 0;
-  fgColorMode: ColorMode = ColorMode.DEFAULT;
-  bgColorMode: ColorMode = ColorMode.DEFAULT;
-
-  constructor(
-    cell: IBufferCell | null,
-    x: number,
-    y: number,
-    cursorX: number,
-    cursorY: number,
-  ) {
-    this.x = x;
-    this.y = y;
-    this.cursorX = cursorX;
-    this.cursorY = cursorY;
-
-    if (!cell) {
-      this.chars = ' ';
-      return;
-    }
-
-    this.chars = cell.getChars();
-
-    if (cell.isInverse()) {
-      this.attributes += Attribute.inverse;
-    }
-    if (cell.isBold()) {
-      this.attributes += Attribute.bold;
-    }
-    if (cell.isItalic()) {
-      this.attributes += Attribute.italic;
-    }
-    if (cell.isUnderline()) {
-      this.attributes += Attribute.underline;
-    }
-    if (cell.isDim()) {
-      this.attributes += Attribute.dim;
-    }
-
-    if (cell.isFgRGB()) {
-      this.fgColorMode = ColorMode.RGB;
-    } else if (cell.isFgPalette()) {
-      this.fgColorMode = ColorMode.PALETTE;
-    } else {
-      this.fgColorMode = ColorMode.DEFAULT;
-    }
-
-    if (cell.isBgRGB()) {
-      this.bgColorMode = ColorMode.RGB;
-    } else if (cell.isBgPalette()) {
-      this.bgColorMode = ColorMode.PALETTE;
-    } else {
-      this.bgColorMode = ColorMode.DEFAULT;
-    }
-
-    if (this.fgColorMode === ColorMode.DEFAULT) {
-      this.fg = -1;
-    } else {
-      this.fg = cell.getFgColor();
-    }
-
-    if (this.bgColorMode === ColorMode.DEFAULT) {
-      this.bg = -1;
-    } else {
-      this.bg = cell.getBgColor();
-    }
-  }
-
-  isCursor(): boolean {
-    return this.x === this.cursorX && this.y === this.cursorY;
-  }
-
-  getChars(): string {
-    return this.chars;
-  }
-
-  isAttribute(attribute: Attribute): boolean {
-    return (this.attributes & attribute) !== 0;
-  }
-
-  equals(other: Cell): boolean {
-    return (
-      this.attributes === other.attributes &&
-      this.fg === other.fg &&
-      this.bg === other.bg &&
-      this.fgColorMode === other.fgColorMode &&
-      this.bgColorMode === other.bgColorMode &&
-      this.isCursor() === other.isCursor()
-    );
-  }
 }
 
 export function serializeTerminalToObject(
@@ -160,46 +60,99 @@ export function serializeTerminalToObject(
       continue;
     }
 
-    let lastCell = new Cell(null, -1, -1, cursorX, cursorY);
+    let lastFg = -1;
+    let lastBg = -1;
+    let lastFgMode = ColorMode.DEFAULT;
+    let lastBgMode = ColorMode.DEFAULT;
+    let lastAttrs = 0;
+    let lastIsCursor = false;
     let currentText = '';
 
     for (let x = 0; x < terminal.cols; x++) {
-      const cellData = line.getCell(x, reusableCell);
-      const cell = new Cell(cellData || null, x, y, cursorX, cursorY);
-
-      if (x > 0 && !cell.equals(lastCell)) {
+      const cell = line.getCell(x, reusableCell);
+      if (!cell) {
         if (currentText) {
-          const token: AnsiToken = {
+          currentLine.push({
             text: currentText,
-            bold: lastCell.isAttribute(Attribute.bold),
-            italic: lastCell.isAttribute(Attribute.italic),
-            underline: lastCell.isAttribute(Attribute.underline),
-            dim: lastCell.isAttribute(Attribute.dim),
-            inverse:
-              lastCell.isAttribute(Attribute.inverse) || lastCell.isCursor(),
-            fg: convertColorToHex(lastCell.fg, lastCell.fgColorMode, defaultFg),
-            bg: convertColorToHex(lastCell.bg, lastCell.bgColorMode, defaultBg),
-          };
-          currentLine.push(token);
+            bold: (lastAttrs & Attribute.bold) !== 0,
+            italic: (lastAttrs & Attribute.italic) !== 0,
+            underline: (lastAttrs & Attribute.underline) !== 0,
+            dim: (lastAttrs & Attribute.dim) !== 0,
+            inverse: (lastAttrs & Attribute.inverse) !== 0 || lastIsCursor,
+            fg: convertColorToHex(lastFg, lastFgMode, defaultFg),
+            bg: convertColorToHex(lastBg, lastBgMode, defaultBg),
+          });
+          currentText = '';
+        }
+        continue;
+      }
+
+      const isCursor = x === cursorX && y === cursorY;
+      let attrs = 0;
+      if (cell.isInverse()) attrs |= Attribute.inverse;
+      if (cell.isBold()) attrs |= Attribute.bold;
+      if (cell.isItalic()) attrs |= Attribute.italic;
+      if (cell.isUnderline()) attrs |= Attribute.underline;
+      if (cell.isDim()) attrs |= Attribute.dim;
+
+      const fgMode = cell.isFgRGB()
+        ? ColorMode.RGB
+        : cell.isFgPalette()
+          ? ColorMode.PALETTE
+          : ColorMode.DEFAULT;
+      const bgMode = cell.isBgRGB()
+        ? ColorMode.RGB
+        : cell.isBgPalette()
+          ? ColorMode.PALETTE
+          : ColorMode.DEFAULT;
+      const fg = fgMode === ColorMode.DEFAULT ? -1 : cell.getFgColor();
+      const bg = bgMode === ColorMode.DEFAULT ? -1 : cell.getBgColor();
+
+      const cellChanged =
+        x > 0 &&
+        (attrs !== lastAttrs ||
+          fg !== lastFg ||
+          bg !== lastBg ||
+          fgMode !== lastFgMode ||
+          bgMode !== lastBgMode ||
+          isCursor !== lastIsCursor);
+
+      if (cellChanged) {
+        if (currentText) {
+          currentLine.push({
+            text: currentText,
+            bold: (lastAttrs & Attribute.bold) !== 0,
+            italic: (lastAttrs & Attribute.italic) !== 0,
+            underline: (lastAttrs & Attribute.underline) !== 0,
+            dim: (lastAttrs & Attribute.dim) !== 0,
+            inverse: (lastAttrs & Attribute.inverse) !== 0 || lastIsCursor,
+            fg: convertColorToHex(lastFg, lastFgMode, defaultFg),
+            bg: convertColorToHex(lastBg, lastBgMode, defaultBg),
+          });
         }
         currentText = '';
       }
+
       currentText += cell.getChars();
-      lastCell = cell;
+      lastFg = fg;
+      lastBg = bg;
+      lastFgMode = fgMode;
+      lastBgMode = bgMode;
+      lastAttrs = attrs;
+      lastIsCursor = isCursor;
     }
 
     if (currentText) {
-      const token: AnsiToken = {
+      currentLine.push({
         text: currentText,
-        bold: lastCell.isAttribute(Attribute.bold),
-        italic: lastCell.isAttribute(Attribute.italic),
-        underline: lastCell.isAttribute(Attribute.underline),
-        dim: lastCell.isAttribute(Attribute.dim),
-        inverse: lastCell.isAttribute(Attribute.inverse) || lastCell.isCursor(),
-        fg: convertColorToHex(lastCell.fg, lastCell.fgColorMode, defaultFg),
-        bg: convertColorToHex(lastCell.bg, lastCell.bgColorMode, defaultBg),
-      };
-      currentLine.push(token);
+        bold: (lastAttrs & Attribute.bold) !== 0,
+        italic: (lastAttrs & Attribute.italic) !== 0,
+        underline: (lastAttrs & Attribute.underline) !== 0,
+        dim: (lastAttrs & Attribute.dim) !== 0,
+        inverse: (lastAttrs & Attribute.inverse) !== 0 || lastIsCursor,
+        fg: convertColorToHex(lastFg, lastFgMode, defaultFg),
+        bg: convertColorToHex(lastBg, lastBgMode, defaultBg),
+      });
     }
 
     result.push(currentLine);

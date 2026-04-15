@@ -271,7 +271,7 @@ const replayTerminalOutput = async (
     allowProposedApi: true,
     cols,
     rows,
-    scrollback: 1000, // Reduced from 10000 to prevent OOM
+    scrollback: 500, // Further reduced to prevent OOM
     convertEol: true,
   });
 
@@ -448,7 +448,7 @@ export class ShellExecutionService {
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
-        const MAX_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB limit to prevent OOM on low-memory systems
+        const MAX_BUFFER_SIZE = 512 * 1024; // 512KB limit to prevent OOM on low-memory systems
         let sniffedBytes = 0;
         let totalBytesReceived = 0;
 
@@ -468,14 +468,32 @@ export class ShellExecutionService {
 
           // Check buffer size limit to prevent OOM on low-memory systems
           if (totalBytesReceived > MAX_BUFFER_SIZE) {
-            debugLogger.warn(
-              `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating. ` +
-                `Total received: ${totalBytesReceived} bytes.`,
-            );
-            // Don't push more data if we've hit the limit
-          } else {
-            outputChunks.push(data);
+            if (!exited) {
+              debugLogger.warn(
+                `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, killing process to prevent OOM. ` +
+                  `Total received: ${totalBytesReceived} bytes.`,
+              );
+              if (child.pid) {
+                if (isWindows) {
+                  cpSpawn('taskkill', [
+                    '/pid',
+                    child.pid.toString(),
+                    '/f',
+                    '/t',
+                  ]);
+                } else {
+                  try {
+                    process.kill(-child.pid, 'SIGKILL');
+                  } catch {
+                    child.kill('SIGKILL');
+                  }
+                }
+              }
+            }
+            return;
           }
+
+          outputChunks.push(data);
 
           if (isStreamingRawContent && sniffedBytes < MAX_SNIFF_SIZE) {
             const sniffBuffer = Buffer.concat(outputChunks.slice(0, 20));
@@ -688,7 +706,7 @@ export class ShellExecutionService {
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
-        const MAX_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB limit to prevent OOM on low-memory systems
+        const MAX_BUFFER_SIZE = 512 * 1024; // 512KB limit to prevent OOM on low-memory systems
         let sniffedBytes = 0;
         let totalBytesReceived = 0;
         let isWriting = false;
@@ -837,14 +855,24 @@ export class ShellExecutionService {
 
           // Check buffer size limit to prevent OOM on low-memory systems
           if (totalBytesReceived > MAX_BUFFER_SIZE) {
-            if (outputChunks.length > 0) {
+            if (!exited) {
               debugLogger.warn(
-                `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, truncating stream processing. ` +
+                `Output buffer exceeded ${MAX_BUFFER_SIZE} bytes, killing process to prevent OOM. ` +
                   `Total received: ${totalBytesReceived} bytes.`,
               );
+              // Aggressively kill the process and its group
+              if (ptyProcess.pid) {
+                if (os.platform() === 'win32') {
+                  ptyProcess.kill();
+                } else {
+                  try {
+                    process.kill(-ptyProcess.pid, 'SIGKILL');
+                  } catch {
+                    ptyProcess.kill();
+                  }
+                }
+              }
             }
-            // STOP processing and adding to chain once we hit the limit.
-            // This prevents OOM on extremely large outputs (e.g. cat large_file.txt).
             return;
           }
 
